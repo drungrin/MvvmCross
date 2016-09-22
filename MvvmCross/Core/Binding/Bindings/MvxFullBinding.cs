@@ -1,266 +1,135 @@
-// MvxFullBinding.cs
+// MvxTargetBindingFactoryRegistry.cs
 
 // MvvmCross is licensed using Microsoft Public License (Ms-PL)
 // Contributions and inspirations noted in readme.md and license.txt
 //
 // Project Lead - Stuart Lodge, @slodge, me@slodge.com
 
-using System.Threading;
-using MvvmCross.Platform;
-using MvvmCross.Platform.Core;
-
-namespace MvvmCross.Binding.Bindings
+namespace MvvmCross.Binding.Bindings.Target.Construction
 {
     using System;
+    using System.Collections.Generic;
+    using System.Reflection;
 
-    using MvvmCross.Binding.Bindings.SourceSteps;
-    using MvvmCross.Binding.Bindings.Target;
-    using MvvmCross.Binding.Bindings.Target.Construction;
-    using MvvmCross.Platform.Converters;
-    using MvvmCross.Platform.Exceptions;
-    using MvvmCross.Platform.IoC;
+    using MvvmCross.Platform;
     using MvvmCross.Platform.Platform;
 
-    public class MvxFullBinding
-        : MvxBinding
-          , IMvxUpdateableBinding
+    public class MvxTargetBindingFactoryRegistry : IMvxTargetBindingFactoryRegistry
     {
-        private IMvxSourceStepFactory SourceStepFactory => MvxBindingSingletonCache.Instance.SourceStepFactory;
+        private readonly Dictionary<string, IMvxPluginTargetBindingFactory> _lookups =
+            new Dictionary<string, IMvxPluginTargetBindingFactory>();
 
-        private IMvxTargetBindingFactory TargetBindingFactory => MvxBindingSingletonCache.Instance.TargetBindingFactory;
-
-        private readonly MvxBindingDescription _bindingDescription;
-        private IMvxSourceStep _sourceStep;
-        private IMvxTargetBinding _targetBinding;
-        private readonly object _targetLocker = new object();
-
-        private object _dataContext;
-        private EventHandler _sourceBindingOnChanged;
-        private EventHandler<MvxTargetChangedEventArgs> _targetBindingOnValueChanged;
-
-        private object _defaultTargetValue;
-        private CancellationTokenSource _cancelSource = new CancellationTokenSource();
-        private IMvxMainThreadDispatcher dispatcher => MvxBindingSingletonCache.Instance.MainThreadDispatcher;
-
-        public object DataContext
+        public virtual IMvxTargetBinding CreateBinding(object target, string targetName)
         {
-            get { return this._dataContext; }
-            set
-            {
-                if (this._dataContext == value)
-                    return;
-                this._dataContext = value;
+            IMvxTargetBinding binding;
+            if (this.TryCreateSpecificFactoryBinding(target, targetName, out binding))
+                return binding;
 
-                if (this._sourceStep != null)
-                    this._sourceStep.DataContext = value;
+            if (this.TryCreateReflectionBasedBinding(target, targetName, out binding))
+                return binding;
 
-                this.UpdateTargetOnBind();
-            }
+            return null;
         }
 
-        public MvxFullBinding(MvxBindingRequest bindingRequest)
+        protected virtual bool TryCreateReflectionBasedBinding(object target, string targetName,
+                                                               out IMvxTargetBinding binding)
         {
-            this._bindingDescription = bindingRequest.Description;
-            this.CreateTargetBinding(bindingRequest.Target);
-            this.CreateSourceBinding(bindingRequest.Source);
-        }
-
-        protected virtual void ClearSourceBinding()
-        {
-            if (this._sourceStep != null)
+            if (string.IsNullOrEmpty(targetName))
             {
-                if (this._sourceBindingOnChanged != null)
-                {
-                    this._sourceStep.Changed -= this._sourceBindingOnChanged;
-                    this._sourceBindingOnChanged = null;
-                }
-
-                this._sourceStep.Dispose();
-                this._sourceStep = null;
-            }
-        }
-
-        private void CreateSourceBinding(object source)
-        {
-            this._dataContext = source;
-            this._sourceStep = this.SourceStepFactory.Create(this._bindingDescription.Source);
-            this._sourceStep.TargetType = this._targetBinding.TargetType;
-            this._sourceStep.DataContext = source;
-
-            if (this.NeedToObserveSourceChanges)
-            {
-                this._sourceBindingOnChanged = (sender, args) =>
-                    {
-                        //Capture the cancel token first
-                        var cancel = _cancelSource.Token;
-                        //GetValue can now be executed in a worker thread. Is it the responsibility of the caller to switch threads, or ours ?
-                        //As the source is the viewmodel, i suppose it is the responsibility of the caller.
-                        var value = this._sourceStep.GetValue();
-                        this.UpdateTargetFromSource(value, cancel);
-                    };
-                this._sourceStep.Changed += this._sourceBindingOnChanged;
+                MvxBindingTrace.Trace(MvxTraceLevel.Error,
+                                      "Empty binding target passed to MvxTargetBindingFactoryRegistry");
+                binding = null;
+                return false;
             }
 
-            this.UpdateTargetOnBind();
-        }
-
-        private void UpdateTargetOnBind()
-        {
-            if (this.NeedToUpdateTargetOnBind && this._sourceStep != null)
+            if (target == null)
             {
-                _cancelSource.Cancel();
-                _cancelSource = new CancellationTokenSource();
-                var cancel = _cancelSource.Token;
+                // null passed in so return false - fixes #584
+                binding = null;
+                return false;
+            }
 
-                try
+            var targetPropertyInfo = target.GetType().GetProperty(targetName);
+            if (targetPropertyInfo != null
+                && targetPropertyInfo.CanWrite)
+            {
+                binding = new MvxWithEventPropertyInfoTargetBinding(target, targetPropertyInfo);
+                return true;
+            }
+
+            var targetEventInfo = target.GetType().GetEvent(targetName);
+            if (targetEventInfo != null)
+            {
+                // we only handle EventHandler's here
+                // other event types will need to be handled by custom bindings
+                if (targetEventInfo.EventHandlerType == typeof(EventHandler))
                 {
-                    var currentValue = this._sourceStep.GetValue();
-                    this.UpdateTargetFromSource(currentValue, cancel);
-                }
-                catch (Exception exception)
-                {
-                    MvxBindingTrace.Trace("Exception masked in UpdateTargetOnBind {0}", exception.ToLongString());
+                    binding = new MvxEventHandlerEventInfoTargetBinding(target, targetEventInfo);
+                    return true;
                 }
             }
+
+            binding = null;
+            return false;
         }
 
-        protected virtual void ClearTargetBinding()
+        protected virtual bool TryCreateSpecificFactoryBinding(object target, string targetName,
+                                                               out IMvxTargetBinding binding)
         {
-            lock (this._targetLocker)
+            if (target == null)
             {
-                if (this._targetBinding != null)
-                {
-                    if (this._targetBindingOnValueChanged != null)
-                    {
-                        this._targetBinding.ValueChanged -= this._targetBindingOnValueChanged;
-                        this._targetBindingOnValueChanged = null;
-                    }
-
-                    this._targetBinding.Dispose();
-                    this._targetBinding = null;
-                }
+                // null passed in so return false - fixes #584
+                binding = null;
+                return false;
             }
+
+            var factory = this.FindSpecificFactory(target.GetType(), targetName);
+            if (factory != null)
+            {
+                binding = factory.CreateBinding(target, targetName);
+                return true;
+            }
+
+            binding = null;
+            return false;
         }
 
-        private void CreateTargetBinding(object target)
+        public void RegisterFactory(IMvxPluginTargetBindingFactory factory)
         {
-            this._targetBinding = this.TargetBindingFactory.CreateBinding(target, this._bindingDescription.TargetName);
-
-            if (this._targetBinding == null)
+            foreach (var supported in factory.SupportedTypes)
             {
-                MvxBindingTrace.Trace(MvxTraceLevel.Warning, "Failed to create target binding for {0}", this._bindingDescription.ToString());
-                this._targetBinding = new MvxNullTargetBinding();
-            }
-
-            if (this.NeedToObserveTargetChanges)
-            {
-                this._targetBinding.SubscribeToEvents();
-                this._targetBindingOnValueChanged = (sender, args) => this.UpdateSourceFromTarget(args.Value);
-                this._targetBinding.ValueChanged += this._targetBindingOnValueChanged;
-            }
-
-            this._defaultTargetValue = this._targetBinding.TargetType.CreateDefault();
-        }
-
-        private void UpdateTargetFromSource(object value, CancellationToken cancel)
-        {
-            if (value == MvxBindingConstant.DoNothing || cancel.IsCancellationRequested)
-                return;
-
-            if (value == MvxBindingConstant.UnsetValue)
-                value = _defaultTargetValue;
-
-            dispatcher.RequestMainThreadAction(() =>
-            {
-                if (cancel.IsCancellationRequested)
-                    return;
-
-                try
-                {
-                    lock (this._targetLocker)
-                    {
-                        this._targetBinding?.SetValue(value);
-                    }
-                }
-                catch (Exception exception)
-                {
-                    MvxBindingTrace.Trace(
-                        MvxTraceLevel.Error,
-                        "Problem seen during binding execution for {0} - problem {1}",
-                        this._bindingDescription.ToString(),
-                        exception.ToLongString());
-                }
-            });
-        }
-
-        private void UpdateSourceFromTarget(
-            object value)
-        {
-            if (value == MvxBindingConstant.DoNothing)
-                return;
-
-            if (value == MvxBindingConstant.UnsetValue)
-                return;
-
-            try
-            {
-                this._sourceStep.SetValue(value);
-            }
-            catch (Exception exception)
-            {
-                MvxBindingTrace.Trace(
-                    MvxTraceLevel.Error,
-                    "Problem seen during binding execution for {0} - problem {1}",
-                    this._bindingDescription.ToString(),
-                    exception.ToLongString());
+                var key = GenerateKey(supported.Type, supported.Name);
+                this._lookups[key] = factory;
             }
         }
 
-        protected bool NeedToObserveSourceChanges
+        private static string GenerateKey(Type type, string name)
         {
-            get
-            {
-                var mode = this.ActualBindingMode;
-                return mode.RequireSourceObservation();
-            }
+            return $"{type.FullName}:{name}";
         }
 
-        protected bool NeedToObserveTargetChanges
+        private IMvxPluginTargetBindingFactory FindSpecificFactory(Type type, string name)
         {
-            get
+            IMvxPluginTargetBindingFactory factory;
+            var key = GenerateKey(type, name);
+            if (this._lookups.TryGetValue(key, out factory))
             {
-                var mode = this.ActualBindingMode;
-                return mode.RequiresTargetObservation();
+                return factory;
             }
-        }
 
-        protected bool NeedToUpdateTargetOnBind
-        {
-            get
+            var implementedInterfaces = type.GetTypeInfo().ImplementedInterfaces;
+            foreach (var implementedInterface in implementedInterfaces)
             {
-                var bindingMode = this.ActualBindingMode;
-                return bindingMode.RequireTargetUpdateOnFirstBind();
+                factory = this.FindSpecificFactory(implementedInterface, name);
+                if (factory != null) return factory;
             }
-        }
 
-        protected MvxBindingMode ActualBindingMode
-        {
-            get
-            {
-                var mode = this._bindingDescription.Mode;
-                if (mode == MvxBindingMode.Default)
-                    mode = this._targetBinding.DefaultMode;
-                return mode;
-            }
-        }
+            var baseType = type.GetTypeInfo().BaseType;
 
-        protected override void Dispose(bool isDisposing)
-        {
-            if (isDisposing)
-            {
-                this.ClearTargetBinding();
-                this.ClearSourceBinding();
-            }
+            if (baseType != null)
+                return this.FindSpecificFactory(baseType, name);
+
+            return null;
         }
     }
 }
